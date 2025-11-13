@@ -288,6 +288,190 @@ class StringMatcher:
 
 
 # =============================================================================
+# Step 3: 基于依赖关系构建簇对（改造版）
+# =============================================================================
+
+class ClusterPairBuilder:
+    """构建簇对分析任务(更精细的粒度)"""
+    
+    def __init__(self, dependency_data: Dict, candidates: Dict, clusters_def: Dict):
+        self.dependency_data = dependency_data
+        self.candidates = candidates
+        self.clusters_def = clusters_def
+    
+    def build_pairs(self) -> List[Dict]:
+        """生成两两簇对的分析任务(去重版 + 过滤未使用的簇)"""
+        
+        print("="*70)
+        print("🔗 Step 3: 构建簇对分析任务（以簇对为中心）")
+        print("="*70)
+        
+        # 首先构建文件->参数映射（按簇分组）
+        file_to_params = self._build_file_param_mapping()
+        
+        # 识别实际被使用的簇
+        used_clusters = set()
+        for file_data in file_to_params.values():
+            used_clusters.update(file_data['clusters'])
+        
+        # 统计未使用的簇
+        all_clusters = set(self.clusters_def.keys())
+        unused_clusters = all_clusters - used_clusters
+        
+        print(f"📊 参数簇统计:")
+        print(f"   - 定义的簇总数: {len(all_clusters)}")
+        print(f"   - 实际使用的簇: {len(used_clusters)}")
+        print(f"   - 未使用的簇: {len(unused_clusters)}")
+        
+        if unused_clusters:
+            print(f"\n⚠️  以下簇未在代码中使用，将被跳过:")
+            for cluster in sorted(unused_clusters):
+                print(f"      - {cluster}")
+        print()
+        
+        # 只枚举被使用的簇对
+        from itertools import combinations
+        used_cluster_list = sorted(list(used_clusters))
+        all_possible_pairs = list(combinations(used_cluster_list, 2))
+        
+        print(f"📊 基于 {len(used_clusters)} 个使用中的簇:")
+        print(f"   - 理论簇对数: {len(all_possible_pairs)}\n")
+        
+        # 使用字典存储簇对，键为规范化的簇对标识
+        cluster_pair_dict = {}
+        
+        # 为每个簇对收集代码上下文
+        for cluster1, cluster2 in all_possible_pairs:
+            contexts = self._collect_contexts_for_cluster_pair(
+                cluster1, cluster2, file_to_params
+            )
+            
+            if contexts:  # 只保留有代码上下文的簇对
+                pair_key = self._make_cluster_pair_key(cluster1, cluster2)
+                cluster_pair_dict[pair_key] = {
+                    'cluster_pair': (cluster1, cluster2),
+                    'contexts': contexts,
+                    'context_count': len(contexts),
+                    'has_intra_file': any(c['type'] == 'INTRA_FILE' for c in contexts),
+                    'has_inter_file': any(c['type'] == 'INTER_FILE' for c in contexts)
+                }
+        
+        cluster_pairs = list(cluster_pair_dict.values())
+        
+        # 统计
+        print(f"✅ 构建了 {len(cluster_pairs)} 个有代码上下文的簇对")
+        print(f"   - 仅单文件内共现: {sum(1 for p in cluster_pairs if p['has_intra_file'] and not p['has_inter_file'])}")
+        print(f"   - 仅跨文件依赖: {sum(1 for p in cluster_pairs if p['has_inter_file'] and not p['has_intra_file'])}")
+        print(f"   - 两者都有: {sum(1 for p in cluster_pairs if p['has_intra_file'] and p['has_inter_file'])}")
+        print(f"   - 无代码关联的簇对: {len(all_possible_pairs) - len(cluster_pairs)} (已过滤)\n")
+        
+        return cluster_pairs
+    
+    def _build_file_param_mapping(self) -> Dict:
+        """构建文件->参数映射（按簇分组）"""
+        file_to_params = {}
+        
+        for cluster_name, files in self.candidates.items():
+            # 跳过没有匹配文件的簇
+            if not files:
+                continue
+                
+            for f in files:
+                fp = f['file']
+                if fp not in file_to_params:
+                    file_to_params[fp] = {
+                        'clusters': set(),
+                        'params_by_cluster': {}
+                    }
+                
+                file_to_params[fp]['clusters'].add(cluster_name)
+                file_to_params[fp]['params_by_cluster'][cluster_name] = {
+                    'params': f['matched_params'],
+                    'params_info': f['params_info'],
+                    'contexts': f.get('contexts', [])
+                }
+        
+        return file_to_params
+    
+    def _collect_contexts_for_cluster_pair(self, 
+                                           cluster1: str, 
+                                           cluster2: str,
+                                           file_to_params: Dict) -> List[Dict]:
+        """为指定簇对收集所有代码上下文"""
+        contexts = []
+        
+        # 1. 单文件内共现
+        for file_path, file_data in file_to_params.items():
+            file_clusters = file_data['clusters']
+            
+            if cluster1 in file_clusters and cluster2 in file_clusters:
+                contexts.append({
+                    'type': 'INTRA_FILE',
+                    'file': file_path,
+                    'cluster1': cluster1,
+                    'cluster2': cluster2,
+                    'cluster1_params': file_data['params_by_cluster'][cluster1],
+                    'cluster2_params': file_data['params_by_cluster'][cluster2]
+                })
+        
+        # 2. 跨文件依赖
+        module_deps = (self.dependency_data
+                      .get('dependency_analysis', {})
+                      .get('dependency_relationships', {})
+                      .get('module_dependencies', []))
+        
+        for dep in module_deps:
+            caller = dep.get('source_path')
+            callee = dep.get('target_path')
+            
+            caller_info = file_to_params.get(caller)
+            callee_info = file_to_params.get(callee)
+            
+            if not (caller_info and callee_info):
+                continue
+            
+            caller_clusters = caller_info['clusters']
+            callee_clusters = callee_info['clusters']
+            
+            # 情况1: caller有cluster1, callee有cluster2
+            if cluster1 in caller_clusters and cluster2 in callee_clusters:
+                contexts.append({
+                    'type': 'INTER_FILE',
+                    'caller_file': caller,
+                    'callee_file': callee,
+                    'caller_cluster': cluster1,
+                    'callee_cluster': cluster2,
+                    'caller_params': caller_info['params_by_cluster'][cluster1],
+                    'callee_params': callee_info['params_by_cluster'][cluster2],
+                    'module': dep.get('module_type'),
+                    'instance': dep.get('instance_name'),
+                    'instantiation_code': dep.get('description', ''),
+                    'direction': f'{cluster1}→{cluster2}'
+                })
+            
+            # 情况2: caller有cluster2, callee有cluster1（反向）
+            if cluster2 in caller_clusters and cluster1 in callee_clusters:
+                contexts.append({
+                    'type': 'INTER_FILE',
+                    'caller_file': caller,
+                    'callee_file': callee,
+                    'caller_cluster': cluster2,
+                    'callee_cluster': cluster1,
+                    'caller_params': caller_info['params_by_cluster'][cluster2],
+                    'callee_params': callee_info['params_by_cluster'][cluster1],
+                    'module': dep.get('module_type'),
+                    'instance': dep.get('instance_name'),
+                    'instantiation_code': dep.get('description', ''),
+                    'direction': f'{cluster2}→{cluster1}'
+                })
+        
+        return contexts
+    
+    def _make_cluster_pair_key(self, cluster1: str, cluster2: str) -> str:
+        """生成簇对的唯一键（无序）"""
+        c1, c2 = sorted([cluster1, cluster2])
+        return f"{c1}↔{c2}"
+# =============================================================================
 # Step 3: 基于依赖关系构建文件对
 # =============================================================================
 
@@ -400,433 +584,273 @@ class FilePairBuilder:
 # Step 4: LLM 分析文件对
 # =============================================================================
 
+# =============================================================================
+# Step 4: LLM Analysis - Cluster Pair Centric Approach
+# =============================================================================
+
 class LLMCouplingAnalyzer:
-    """使用LLM分析文件对的参数耦合"""
+    """Analyze parameter coupling between cluster pairs using LLM"""
     
-    def __init__(self, file_pairs: List[Dict], clusters_def: Dict):
-        self.file_pairs = file_pairs
-        self.clusters_def = clusters_def  # 保存原始簇定义，用于分组参数
+    def __init__(self, cluster_pairs: List[Dict], clusters_def: Dict):
+        """
+        Args:
+            cluster_pairs: List of cluster pair tasks from ClusterPairBuilder
+            clusters_def: Original cluster definitions (cluster_name -> param_list)
+        """
+        self.cluster_pairs = cluster_pairs
+        self.clusters_def = clusters_def
     
-    def format_params_info(self, params_info: List[Dict]) -> str:
-        """格式化参数信息为易读文本"""
+    def _format_params_info(self, params_info: List[Dict]) -> str:
+        """Format parameter information into readable text"""
         lines = []
         for p in params_info:
-            line = f"  - {p['name']} ({p['type']})"
-            if p['default']:
+            line = f"- **{p['name']}** ({p['type']})"
+            if p.get('default'):
                 line += f" = {p['default']}"
-            if p['range']:
+            if p.get('range'):
                 line += f" [{p['range']}]"
-            if p['comment']:
+            if p.get('comment'):
                 line += f"  // {p['comment']}"
             lines.append(line)
-        return '\n'.join(lines)
+        return '\n'.join(lines) if lines else "  (No parameters)"
     
-    def format_params_by_cluster(self, params_info: List[Dict], clusters: List[str]) -> str:
-        """按簇分组并格式化参数信息"""
-        output_lines = []
+    def generate_prompt(self, pair_task: Dict) -> str:
+        """Generate LLM prompt for analyzing a cluster pair
         
-        for cluster_name in clusters:
-            cluster_params_list = self.clusters_def.get(cluster_name, [])
-            cluster_params_set = set(cluster_params_list)
-            
-            # 过滤属于该簇的参数
-            params_in_cluster = [p for p in params_info if p['name'] in cluster_params_set]
-            
-            if params_in_cluster:
-                output_lines.append(f"\n### 簇: {cluster_name} ({len(params_in_cluster)} 个参数)")
-                for p in params_in_cluster:
-                    line = f"  - {p['name']} ({p['type']})"
-                    if p['default']:
-                        line += f" = {p['default']}"
-                    if p['range']:
-                        line += f" [{p['range']}]"
-                    if p['comment']:
-                        line += f"  // {p['comment']}"
-                    output_lines.append(line)
+        This method aggregates all code contexts where the cluster pair appears
+        """
+        cluster1, cluster2 = pair_task['cluster_pair']
+        contexts = pair_task['contexts']
         
-        return '\n'.join(output_lines)
-    
-    def generate_inter_file_prompt(self, pair: Dict) -> str:
-        """生成跨文件分析的提示词（优化版）"""
+        # Get parameter definitions from the first context
+        first_ctx = contexts[0]
+        if first_ctx['type'] == 'INTRA_FILE':
+            cluster1_params = first_ctx['cluster1_params']['params_info']
+            cluster2_params = first_ctx['cluster2_params']['params_info']
+        else:  # INTER_FILE
+            cluster1_params = first_ctx['caller_params']['params_info']
+            cluster2_params = first_ctx['callee_params']['params_info']
         
-        # 按簇分组显示参数
-        caller_params_text = self.format_params_by_cluster(
-            pair['caller_params_info'], 
-            pair['caller_clusters']
-        )
-        callee_params_text = self.format_params_by_cluster(
-            pair['callee_params_info'], 
-            pair['callee_clusters']
-        )
-        
-        prompt = f"""# 硬件参数耦合分析任务
+        prompt = f"""# Hardware Parameter Cluster Coupling Analysis
 
-## 背景
-这是一个硬件设计项目的配置参数分析。配置参数在编译时确定硬件模块的行为特性（如位宽、深度、使能等）。
-
-## 任务目标
-分析两个有模块实例化关系的文件之间，**配置参数的依赖和约束关系**。
+## Objective
+Analyze the coupling relationships between two parameter clusters:
+- **Cluster 1**: {cluster1}
+- **Cluster 2**: {cluster2}
 
 ---
 
-## 调用者文件（实例化其他模块的文件）
-**文件**: `{Path(pair['caller_file']).name}`
-**所属参数簇**: {', '.join(pair['caller_clusters'])}
-
-{caller_params_text}
+## Cluster 1 Parameter Definitions: {cluster1}
+{self._format_params_info(cluster1_params)}
 
 ---
 
-## 被调用文件（被实例化的模块文件）
-**文件**: `{Path(pair['callee_file']).name}`
-**所属参数簇**: {', '.join(pair['callee_clusters'])}
-
-{callee_params_text}
+## Cluster 2 Parameter Definitions: {cluster2}
+{self._format_params_info(cluster2_params)}
 
 ---
 
-## 实例化关系
-```
-调用者文件实例化了被调用文件中定义的模块
-模块类型: {pair['module']}
-实例名称: {pair['instance']}
-上下文: {pair['instantiation_code']}
-```
+## Code Contexts
 
----
+This cluster pair appears in **{len(contexts)}** code context(s):
 
-## 分析指导
-
-### 1. 理解硬件参数耦合的常见模式
-
-**A. 直接参数传递 (DIRECT_PASS)**
-- 调用者通过实例化参数直接传递给被调用者
-- 例如：`top_width` → `fifo_width` (通过 `#(.WIDTH(top_width))`)
-
-**B. 派生计算 (DERIVATION)**
-- 一个参数通过数学公式计算得到另一个参数
-- 例如：`addr_width = log2(depth)`
-
-**C. 约束关系 (CONSTRAINT)**
-- 参数之间必须满足的不等式或等式
-- 例如：`input_width <= output_width` (避免数据截断)
-- 例如：`cache_line_size % bus_width == 0` (对齐要求)
-
-**D. 条件依赖 (CONDITIONAL)**
-- 某参数的值决定另一参数的取值或有效性
-- 例如：`if enable_ecc==1 then ecc_width=8 else ecc_width=0`
-
-**E. 资源约束 (RESOURCE)**
-- 多个参数共享资源限制
-- 例如：`num_channels * channel_width <= total_bandwidth`
-
-**F. 隐式语义依赖 (SEMANTIC)**
-- 功能上相关但无显式代码关联
-- 例如：发送端的 `packet_size` 应 ≤ 接收端的 `buffer_size`
-
-### 2. 分析步骤
-1. 检查调用者是否通过实例化参数传递值给被调用者
-2. 识别参数的语义关系（位宽、深度、使能、配置等）
-3. 推断隐含的约束条件（如位宽匹配、容量限制等）
-4. 判断耦合的强度和置信度
-
-### 3. 置信度评估
-- **high**: 代码中有显式关联（如参数传递、计算公式）
-- **medium**: 语义上强相关（如数据通路的位宽匹配）
-- **low**: 推测性的关系（如可能的资源约束）
-
----
-
-## 输出要求
-
-**JSON格式**，包含以下字段：
-
-```json
-{{
-  "has_coupling": true,
-  "analysis_summary": "简要总结发现的主要耦合模式（1-2句话）",
-  "couplings": [
-    {{
-      "caller_param": "调用者文件中的参数名",
-      "callee_param": "被调用者文件中的参数名",
-      "type": "DIRECT_PASS | DERIVATION | CONSTRAINT | CONDITIONAL | RESOURCE | SEMANTIC",
-      "description": "用一句话清晰描述这个耦合关系",
-      "rule": "形式化规则（如 A=B, A>=B, if A then B, A=log2(B)）",
-      "confidence": "high | medium | low",
-      "reasoning": "为什么认为存在这个耦合（简短说明）"
-    }}
-  ]
-}}
-
-**注意**：
-- 只输出JSON，不要其他解释文字
-- 如果找不到任何耦合，返回 `{{"has_coupling": false, "couplings": []}}`
-- 聚焦于**实际存在的、有意义的**耦合关系，避免臆测
-- 优先标注高置信度的耦合
-
----
-
-请开始分析。
-""" 
-        return prompt
-    
-    def generate_intra_file_prompt(self, pair: Dict) -> str:
-        """生成单文件多簇分析的提示词（优化版）"""
-        
-        # 按簇分组显示参数
-        params_by_cluster = self.format_params_by_cluster(
-            pair['params_info'], 
-            pair['clusters']
-        )
-        
-        prompt = f"""# 单文件内跨簇参数耦合分析
-
-## 背景
-这是一个硬件设计项目的配置参数分析。一个文件可能包含多个功能模块的参数，这些参数被分到了不同的**参数簇**中。
-
-## 任务目标
-分析同一个文件内，**不同参数簇之间的参数耦合关系**。
-
----
-
-## 目标文件
-**文件**: `{Path(pair['file']).name}`
-**在调用链中的角色**: {'调用者 (实例化其他模块)' if pair['role'] == 'caller' else '被调用者 (被其他模块实例化)'}
-**关联文件**: `{Path(pair['other_file']).name}`
-
-## 参数分布
-该文件包含 **{len(pair['clusters'])} 个参数簇**，共 **{len(pair['params'])} 个参数**：
-
-{params_by_cluster}
-
-## 实例化上下文
-```
-模块类型: {pair['module']}
-实例名称: {pair['instance']}
-说明: {pair['instantiation_code']}
-```
-
----
-
-## 分析指导
-
-### 1. 理解跨簇耦合的场景
-
-在硬件设计中，不同功能模块（簇）的参数可能存在隐式约束：
-
-**场景A: 数据通路一致性**
-- 例如：时钟簇的 `clk_freq` 影响 FIFO簇的 `depth`（满足吞吐需求）
-
-**场景B: 资源共享约束**
-- 例如：多个DMA通道的总带宽不能超过总线带宽
-
-**场景C: 层次化派生**
-- 例如：顶层参数 `total_width` 决定了子模块的 `channel_width`
-
-**场景D: 使能开关联动**
-- 例如：`enable_feature_A==1` 时要求 `feature_B_buffer_size >= 1024`
-
-### 2. 分析步骤
-1. **识别簇的语义**：理解每个簇代表的功能模块
-2. **检查参数类型**：位宽、深度、使能、频率等
-3. **推断依赖链**：是否存在"簇A影响簇B"的关系
-4. **评估独立性**：哪些簇之间确实无关联
-
-### 3. 重点关注
-- 不同簇的参数是否在同一数据通路上（位宽需匹配）
-- 是否共享资源（总带宽、总面积等）
-- 是否存在功能依赖（一个簇的使能影响另一簇的配置）
-
----
-
-## 输出要求
-
-**JSON格式**：
-
-```json
-{{
-  "has_coupling": true,
-  "cluster_analysis": [
-    {{
-      "cluster1": "簇名称1",
-      "cluster2": "簇名称2",
-      "relationship": "COUPLED | INDEPENDENT",
-      "summary": "一句话说明这两个簇的关系"
-    }}
-  ],
-  "couplings": [
-    {{
-      "param1": "来自簇1的参数名",
-      "param2": "来自簇2的参数名",
-      "param1_cluster": "簇名称1",
-      "param2_cluster": "簇名称2",
-      "type": "CROSS_CLUSTER_CONSTRAINT | CROSS_CLUSTER_CONDITIONAL | CROSS_CLUSTER_DERIVATION",
-      "description": "清晰描述跨簇耦合关系",
-      "rule": "形式化规则",
-      "confidence": "high | medium | low",
-      "reasoning": "为什么认为存在跨簇耦合"
-    }}
-  ]
-}}
-
-**注意**：
-- 只输出JSON
-- 如果所有簇都独立，也要在 `cluster_analysis` 中明确标注
-- 不要臆测过度，聚焦于实际可能存在的耦合
-
----
-
-请开始分析。
 """
-        return prompt
-    
-    def generate_prompt(self, pair: Dict) -> str:
-        """根据类型生成对应的提示词"""
-        if pair['type'] == 'INTER_FILE':
-            return self.generate_inter_file_prompt(pair)
-        elif pair['type'] == 'INTRA_FILE_MULTI_CLUSTER':
-            return self.generate_intra_file_prompt(pair)
-        else:
-            raise ValueError(f"未知的分析类型: {pair['type']}")
-    
-    def call_llm(self, prompt: str, model: str = "claude-3-5-sonnet-20241022"):
-        """
-        调用LLM API
-        TODO: 实现实际的API调用逻辑
-        """
-        # 这里需要根据您使用的LLM API进行实现
-        # 示例框架：
-        # import anthropic
-        # client = anthropic.Anthropic(api_key="your-api-key")
-        # response = client.messages.create(
-        #     model=model,
-        #     max_tokens=2048,
-        #     messages=[{"role": "user", "content": prompt}]
-        # )
-        # return json.loads(response.content[0].text)
-        pass
+        
+        # List all contexts
+        for i, ctx in enumerate(contexts, 1):
+            if ctx['type'] == 'INTRA_FILE':
+                prompt += f"""
+### Context {i}: Intra-File Co-occurrence
+- **File**: `{Path(ctx['file']).name}`
+- **Description**: This file uses parameters from both clusters
+- **{cluster1} parameter count**: {len(ctx['cluster1_params']['params'])}
+- **{cluster2} parameter count**: {len(ctx['cluster2_params']['params'])}
+- **Sample {cluster1} params**: {', '.join(ctx['cluster1_params']['params'][:5])}{'...' if len(ctx['cluster1_params']['params']) > 5 else ''}
+- **Sample {cluster2} params**: {', '.join(ctx['cluster2_params']['params'][:5])}{'...' if len(ctx['cluster2_params']['params']) > 5 else ''}
+"""
+            else:  # INTER_FILE
+                prompt += f"""
+### Context {i}: Inter-File Dependency
+- **Calling relationship**: `{Path(ctx['caller_file']).name}` → `{Path(ctx['callee_file']).name}`
+- **Cluster direction**: {ctx['direction']}
+- **Module type**: {ctx['module']}
+- **Instance name**: {ctx['instance']}
+- **Instantiation code snippet**: 
+  ```verilog
+  {ctx['instantiation_code'][:300]}   
+  """
+        prompt += """
+## Analysis Guidelines
+1. Common Hardware Parameter Coupling Patterns
+A. DIRECT_PASS (Direct Parameter Passing)
 
-    def analyze_all(self, max_pairs: int = None):
-        """分析所有文件对"""
-        
+Caller passes parameter value to callee through instantiation
+Example: top_width → fifo_width (via #(.WIDTH(top_width)))
+B. DERIVATION (Derived Calculation)
+
+One parameter is mathematically derived from another
+Example: addr_width = log2(depth)
+C. CONSTRAINT (Constraint Relationship)
+
+Parameters must satisfy inequalities or equations
+Example: input_width <= output_width (avoid data truncation)
+Example: cache_line_size % bus_width == 0 (alignment requirement)
+D. CONDITIONAL (Conditional Dependency)
+
+One parameter's value determines another's validity or value
+Example: if enable_ecc==1 then ecc_width=8 else ecc_width=0
+E. RESOURCE (Resource Constraint)
+
+Multiple parameters share resource limitations
+Example: num_channels * channel_width <= total_bandwidth
+F. SEMANTIC (Implicit Semantic Dependency)
+
+Functionally related but no explicit code association
+Example: sender's packet_size should ≤ receiver's buffer_size
+2. Analysis Steps
+Check if caller passes values to callee through instantiation parameters
+Identify semantic relationships (width, depth, enable, configuration, etc.)
+Infer implicit constraints (e.g., width matching, capacity limits)
+Judge coupling strength and confidence level
+3. Confidence Assessment
+high: Explicit association in code (e.g., parameter passing, calculation formula)
+medium: Strong semantic correlation (e.g., data path width matching)
+low: Speculative relationship (e.g., possible resource constraints)
+## Analysis Task
+Please synthesize all the above code contexts and analyze the coupling relationship between these two parameter clusters.
+
+Focus on:
+
+Existence of coupling: Are there dependencies or constraints between parameters from the two clusters?
+Coupling types: Identify the pattern(s) listed above
+Specific parameter pairs: List all discovered parameter coupling pairs
+## Output Format
+Output ONLY JSON, no other text
+
+JSON
+{{
+  "cluster_pair": ["{cluster1}", "{cluster2}"],
+  "has_coupling": true,
+  "analysis_summary": "One sentence summarizing the relationship between these two clusters",
+  "couplings": [
+    {{
+      "param1": "Parameter name from {cluster1}",
+      "param2": "Parameter name from {cluster2}",
+      "param1_cluster": "{cluster1}",
+      "param2_cluster": "{cluster2}",
+      "type": "DIRECT_PASS | DERIVATION | CONSTRAINT | CONDITIONAL | RESOURCE | SEMANTIC",
+      "description": "Clear description of this coupling relationship",
+      "rule": "Formalized rule (e.g., A=B, A>=B, A=log2(B))",
+      "confidence": "high | medium | low",
+      "reasoning": "Brief explanation of why this coupling exists",
+      "evidence_contexts": [1, 2]
+    }}
+  ]
+}}
+Notes:
+
+If no coupling found, return {{"has_coupling": false, "cluster_pair": ["{cluster1}", "{cluster2}"], "couplings": []}}
+
+evidence_contexts indicates which context numbers support this coupling
+
+Focus on actually existing, meaningful coupling relationships, avoid speculation
+
+Prioritize high-confidence couplings """ 
+        return prompt
+    def analyze_all(self, max_pairs: int = None): 
+        """Analyze all cluster pairs"""
         print("="*70)
-        print("🤖 Step 4: LLM 分析")
+        print("🤖 Step 4: LLM Analysis - Cluster Pairs")
         print("="*70)
         
-        pairs_to_analyze = self.file_pairs[:max_pairs] if max_pairs else self.file_pairs
+        pairs_to_analyze = self.cluster_pairs[:max_pairs] if max_pairs else self.cluster_pairs
         
-        # 统计任务类型
-        inter_file_pairs = [p for p in pairs_to_analyze if p['type'] == 'INTER_FILE']
-        intra_file_pairs = [p for p in pairs_to_analyze if p['type'] == 'INTRA_FILE_MULTI_CLUSTER']
-        
-        print(f"准备分析 {len(pairs_to_analyze)} 个任务:")
-        print(f"  - 跨文件分析: {len(inter_file_pairs)}")
-        print(f"  - 单文件多簇分析: {len(intra_file_pairs)}\n")
+        print(f"Preparing to analyze {len(pairs_to_analyze)} cluster pair(s)\n")
         
         results = []
         
-        for i, pair in enumerate(pairs_to_analyze, 1):
-            if pair['type'] == 'INTER_FILE':
-                caller_name = Path(pair['caller_file']).name
-                callee_name = Path(pair['callee_file']).name
-                print(f"[{i}/{len(pairs_to_analyze)}] 跨文件: {caller_name} → {callee_name}", end=' ')
-            else:
-                file_name = Path(pair['file']).name
-                cluster_info = f"{len(pair['clusters'])} 簇"
-                print(f"[{i}/{len(pairs_to_analyze)}] 单文件多簇: {file_name} ({cluster_info})", end=' ')
+        for i, pair_task in enumerate(pairs_to_analyze, 1):
+            cluster1, cluster2 = pair_task['cluster_pair']
+            context_count = pair_task['context_count']
             
-            prompt = self.generate_prompt(pair)
+            print(f"[{i}/{len(pairs_to_analyze)}] Analyzing: ({cluster1}, {cluster2})")
+            print(f"           Contexts: {context_count}", end=' ')
+            
+            if context_count == 0:
+                print("⚠️  No contexts (skipped)")
+                continue
+            
+            prompt = self.generate_prompt(pair_task)
             
             try:
                 analysis = self.call_llm(prompt)
                 
                 if analysis and analysis.get('has_coupling'):
                     coupling_count = len(analysis.get('couplings', []))
-                    print(f"✅ 发现 {coupling_count} 个耦合")
+                    print(f"✅ Found {coupling_count} coupling(s)")
                     
                     results.append({
-                        'task': pair,
+                        'cluster_pair': pair_task['cluster_pair'],
+                        'contexts': pair_task['contexts'],
+                        'context_count': context_count,
+                        'has_intra_file': pair_task['has_intra_file'],
+                        'has_inter_file': pair_task['has_inter_file'],
                         'analysis': analysis
                     })
                 else:
-                    print("➖ 无耦合")
+                    print(f"➖ No coupling")
             
             except Exception as e:
-                print(f"❌ 错误: {e}")
+                print(f"❌ Error: {e}")
         
-        print(f"\n✅ LLM分析完成，共 {len(results)} 个任务发现耦合\n")
+        print(f"\n✅ LLM analysis completed: {len(results)} cluster pair(s) with coupling found\n")
         
         return results
-    
 class CouplingExtractor:
     """从LLM结果提取耦合关系"""
     def __init__(self, llm_results: List[Dict]):
         self.llm_results = llm_results
-    
+
     def extract(self) -> List[Dict]:
-        """提取所有耦合关系"""
+        """Extract all parameter-level couplings with cluster information"""
         
         print("="*70)
-        print("📊 Step 5: 提取耦合关系")
+        print("📋 Step 6: Extracting Parameter-Level Couplings")
         print("="*70)
         
         all_couplings = []
         
         for result in self.llm_results:
-            task = result['task']
+            cluster1, cluster2 = result['cluster_pair']
             analysis = result['analysis']
+            contexts = result['contexts']
             
-            if task['type'] == 'INTER_FILE':
-                # 跨文件耦合
-                for c in analysis.get('couplings', []):
-                    coupling = {
-                        'scope': 'INTER_FILE',
-                        'param1': c.get('caller_param'),
-                        'param2': c.get('callee_param'),
-                        'cluster1': task.get('caller_clusters', []),
-                        'cluster2': task.get('callee_clusters', []),
-                        'type': c.get('type'),
-                        'description': c.get('description'),
-                        'rule': c.get('rule'),
-                        'confidence': c.get('confidence', 'medium'),
-                        'evidence': {
-                            'caller_file': task['caller_file'],
-                            'callee_file': task['callee_file'],
-                            'module': task['module'],
-                            'instance': task['instance']
-                        }
-                    }
-                    all_couplings.append(coupling)
-            
-            elif task['type'] == 'INTRA_FILE_MULTI_CLUSTER':
-                # 单文件多簇耦合
-                for c in analysis.get('couplings', []):
-                    coupling = {
-                        'scope': 'INTRA_FILE_CROSS_CLUSTER',
-                        'param1': c.get('param1'),
-                        'param2': c.get('param2'),
-                        'cluster1': c.get('param1_cluster'),
-                        'cluster2': c.get('param2_cluster'),
-                        'type': c.get('type'),
-                        'description': c.get('description'),
-                        'rule': c.get('rule'),
-                        'confidence': c.get('confidence', 'medium'),
-                        'evidence': {
-                            'file': task['file'],
-                            'role': task['role'],
-                            'other_file': task['other_file'],
-                            'module': task['module'],
-                            'instance': task['instance']
-                        }
-                    }
-                    all_couplings.append(coupling)
+            for coupling in analysis.get('couplings', []):
+                # Enrich coupling with cluster and context information
+                enriched_coupling = {
+                    'param1': coupling.get('param1'),
+                    'param2': coupling.get('param2'),
+                    'param1_cluster': coupling.get('param1_cluster', cluster1),
+                    'param2_cluster': coupling.get('param2_cluster', cluster2),
+                    'type': coupling.get('type'),
+                    'description': coupling.get('description'),
+                    'rule': coupling.get('rule'),
+                    'confidence': coupling.get('confidence', 'medium'),
+                    'reasoning': coupling.get('reasoning', ''),
+                    'evidence_contexts': coupling.get('evidence_contexts', []),
+                    'context_count': result['context_count'],
+                    'has_intra_file': result['has_intra_file'],
+                    'has_inter_file': result['has_inter_file']
+                }
+                
+                all_couplings.append(enriched_coupling)
         
-        print(f"✅ 提取到 {len(all_couplings)} 条耦合关系\n")
+        print(f"✅ Extracted {len(all_couplings)} parameter coupling(s)\n")
         
         return all_couplings
 
     def build_graph(self, couplings: List[Dict]) -> nx.DiGraph:
-        """构建耦合关系图"""
+        """Build parameter coupling graph"""
         
         G = nx.DiGraph()
         
@@ -835,6 +859,11 @@ class CouplingExtractor:
             p2 = c['param2']
             
             if p1 and p2:
+                # Add nodes with cluster information
+                G.add_node(p1, cluster=c['param1_cluster'])
+                G.add_node(p2, cluster=c['param2_cluster'])
+                
+                # Add edge with coupling information
                 G.add_edge(
                     p1, p2,
                     type=c['type'],
@@ -846,31 +875,119 @@ class CouplingExtractor:
         return G
 
     def generate_summary(self, couplings: List[Dict]) -> Dict:
-        """生成统计摘要"""
+        """Generate statistical summary"""
         
         type_counts = defaultdict(int)
-        scope_counts = defaultdict(int)
         conf_counts = defaultdict(int)
+        cluster_pair_counts = defaultdict(int)
         
         for c in couplings:
             type_counts[c['type']] += 1
-            scope_counts[c['scope']] += 1
             conf_counts[c['confidence']] += 1
+            
+            # Count cluster pair combinations
+            c1 = c['param1_cluster']
+            c2 = c['param2_cluster']
+            pair_key = tuple(sorted([c1, c2]))
+            cluster_pair_counts[pair_key] += 1
+        
+        unique_params = set()
+        for c in couplings:
+            if c['param1']:
+                unique_params.add(c['param1'])
+            if c['param2']:
+                unique_params.add(c['param2'])
         
         return {
             'total_couplings': len(couplings),
-            'unique_params': len(set([c['param1'] for c in couplings] + [c['param2'] for c in couplings])),
+            'unique_parameters': len(unique_params),
+            'unique_cluster_pairs': len(cluster_pair_counts),
             'by_type': dict(type_counts),
-            'by_scope': dict(scope_counts),
             'by_confidence': dict(conf_counts),
-            'inter_file_couplings': sum(1 for c in couplings if c['scope'] == 'INTER_FILE'),
-            'cross_cluster_couplings': sum(1 for c in couplings if c['scope'] == 'INTRA_FILE_CROSS_CLUSTER')
+            'by_cluster_pair': dict(cluster_pair_counts),
+            'high_confidence_count': conf_counts.get('high', 0),
+            'medium_confidence_count': conf_counts.get('medium', 0),
+            'low_confidence_count': conf_counts.get('low', 0)
         }
+
+
+def build_coupling_matrix(llm_results: List[Dict], clusters_def: Dict, used_clusters: Set[str] = None) -> Dict:
+    """Build cluster-to-cluster coupling matrix from LLM results
     
+    Args:
+        llm_results: Results from LLMCouplingAnalyzer.analyze_all()
+        clusters_def: Original cluster definitions
+        used_clusters: Set of actually used clusters (optional)
+    
+    Returns:
+        Nested dict: cluster1 -> cluster2 -> coupling info
+    """
+    
+    print("="*70)
+    print("📊 Step 5: Building Cluster Coupling Matrix")
+    print("="*70)
+    
+    # 如果没有提供used_clusters，则从llm_results中推断
+    if used_clusters is None:
+        used_clusters = set()
+        for result in llm_results:
+            c1, c2 = result['cluster_pair']
+            used_clusters.add(c1)
+            used_clusters.add(c2)
+    
+    # 只为使用过的簇构建矩阵
+    cluster_list = sorted(list(used_clusters))
+    
+    # Initialize matrix (only for used clusters)
+    matrix = {
+        c1: {
+            c2: {
+                'has_coupling': False,
+                'coupling_count': 0,
+                'context_count': 0
+            } 
+            for c2 in cluster_list
+        }
+        for c1 in cluster_list
+    }
+    
+    # Fill in results
+    for result in llm_results:
+        c1, c2 = result['cluster_pair']
+        analysis = result['analysis']
+        couplings = analysis.get('couplings', [])
+        
+        coupling_info = {
+            'has_coupling': True,
+            'coupling_count': len(couplings),
+            'context_count': result['context_count'],
+            'has_intra_file': result['has_intra_file'],
+            'has_inter_file': result['has_inter_file'],
+            'summary': analysis.get('analysis_summary', ''),
+            'couplings': couplings
+        }
+        
+        # Symmetric fill (since cluster pairs are unordered)
+        matrix[c1][c2] = coupling_info
+        matrix[c2][c1] = coupling_info
+    
+    # Generate statistics
+    total_pairs_analyzed = len(llm_results)
+    total_couplings = sum(r['analysis'].get('couplings', []) for r in llm_results)
+    total_couplings_count = sum(len(couplings) for couplings in total_couplings)
+    
+    print(f"✅ Matrix built:")
+    print(f"   Used clusters: {len(cluster_list)}")
+    print(f"   Total defined clusters: {len(clusters_def)}")
+    print(f"   Analyzed cluster pairs: {total_pairs_analyzed}")
+    print(f"   Coupled cluster pairs: {total_pairs_analyzed}")
+    print(f"   Total parameter couplings: {total_couplings_count}\n")
+    
+    return matrix
 def main(): 
-    """主流程"""
+    """主流程 - 簇对中心分析"""
     print("\n" + "="*70)
-    print("🚀 参数耦合关系分析系统")
+    print("🚀 参数耦合关系分析系统 (Cluster Pair Centric)")
     print("="*70 + "\n")
 
     # 配置路径
@@ -892,44 +1009,67 @@ def main():
         json.dump(candidates, f, indent=2, ensure_ascii=False)
     print("💾 已保存: candidates.json\n")
 
-    # Step 3: 构建文件对（支持单端多簇和双端分析）
-    pair_builder = FilePairBuilder(loader.dependency_data, candidates)
-    file_pairs = pair_builder.build_pairs()
+    # Step 3: 构建簇对任务（改造版 - 以簇对为中心，自动过滤未使用的簇）
+    cluster_pair_builder = ClusterPairBuilder(
+        loader.dependency_data, 
+        candidates,
+        loader.clusters  # 传入簇定义
+    )
+    cluster_pairs = cluster_pair_builder.build_pairs()
 
-    # 保存file_pairs
-    with open('file_pairs.json', 'w', encoding='utf-8') as f:
-        json.dump(file_pairs, f, indent=2, ensure_ascii=False)
-    print("💾 已保存: file_pairs.json\n")
+    # 保存簇对任务（简化版，用于查看）
+    with open('cluster_pair_tasks.json', 'w', encoding='utf-8') as f:
+        # 只保存关键信息，避免嵌套对象序列化问题
+        simplified_tasks = []
+        for task in cluster_pairs:
+            simplified_tasks.append({
+                'cluster_pair': task['cluster_pair'],
+                'context_count': task['context_count'],
+                'has_intra_file': task['has_intra_file'],
+                'has_inter_file': task['has_inter_file']
+            })
+        json.dump(simplified_tasks, f, indent=2, ensure_ascii=False)
+    print("💾 已保存: cluster_pair_tasks.json\n")
 
-    # Step 4: LLM分析（传入簇定义用于分组显示）
-    llm_analyzer = LLMCouplingAnalyzer(file_pairs, loader.clusters)
-    # 测试：只分析前5对
+    # Step 4: LLM分析簇对（改造版）
+    llm_analyzer = LLMCouplingAnalyzer(cluster_pairs, loader.clusters)
+    
+    # 测试模式：只分析前5对
     # llm_results = llm_analyzer.analyze_all(max_pairs=5)
-    # 完整分析：
+    
+    # 完整分析模式：
     llm_results = llm_analyzer.analyze_all()
 
-    # 保存LLM结果
-    with open('coupling_analysis_results.json', 'w', encoding='utf-8') as f:
-        json.dump(llm_results, f, indent=2, ensure_ascii=False)
-    print("💾 已保存: coupling_analysis_results.json\n")
+    # 保存LLM分析结果
+    with open('cluster_pair_couplings.json', 'w', encoding='utf-8') as f:
+        # 序列化时处理可能的复杂对象
+        json.dump(llm_results, f, indent=2, ensure_ascii=False, default=str)
+    print("💾 已保存: cluster_pair_couplings.json\n")
 
-    # Step 5: 提取耦合关系
+    # Step 5: 构建簇对耦合矩阵（只包含使用的簇）
+    coupling_matrix = build_coupling_matrix(llm_results, loader.clusters)
+    
+    with open('cluster_coupling_matrix.json', 'w', encoding='utf-8') as f:
+        json.dump(coupling_matrix, f, indent=2, ensure_ascii=False)
+    print("💾 已保存: cluster_coupling_matrix.json\n")
+
+    # Step 6: 提取参数级别的耦合（可选）
     extractor = CouplingExtractor(llm_results)
-    couplings = extractor.extract()
+    param_couplings = extractor.extract()
 
-    # 保存耦合关系
+    # 保存参数级别的耦合
     with open('extracted_param_couplings.json', 'w', encoding='utf-8') as f:
-        json.dump(couplings, f, indent=2, ensure_ascii=False)
+        json.dump(param_couplings, f, indent=2, ensure_ascii=False)
     print("💾 已保存: extracted_param_couplings.json\n")
 
-    # 生成摘要
-    summary = extractor.generate_summary(couplings)
+    # 生成统计摘要
+    summary = extractor.generate_summary(param_couplings)
     with open('param_couplings_summary.json', 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print("💾 已保存: param_couplings_summary.json\n")
 
-    # 构建图
-    graph = extractor.build_graph(couplings)
+    # 构建参数耦合图
+    graph = extractor.build_graph(param_couplings)
     nx.write_gexf(graph, 'coupling_graph.gexf')
     print("💾 已保存: coupling_graph.gexf\n")
 
@@ -937,20 +1077,58 @@ def main():
     print("="*70)
     print("📊 最终统计")
     print("="*70)
-    print(f"总耦合数: {summary['total_couplings']}")
-    print(f"涉及参数: {summary['unique_params']}")
-    print(f"\n按范围:")
-    print(f"  - 跨文件耦合: {summary['inter_file_couplings']}")
-    print(f"  - 跨簇耦合 (单文件): {summary['cross_cluster_couplings']}")
-    print(f"\n按类型:")
-    for t, count in summary['by_type'].items():
-        print(f"  - {t}: {count}")
-    print(f"\n按置信度:")
-    for conf, count in summary['by_confidence'].items():
-        print(f"  - {conf}: {count}")
+    
+    # 簇对级别统计
+    total_cluster_pairs = len(cluster_pairs)
+    coupled_cluster_pairs = len(llm_results)
+    
+    print(f"\n【簇对级别统计】")
+    print(f"  分析的簇对数: {total_cluster_pairs}")
+    if total_cluster_pairs > 0:
+        print(f"  有耦合的簇对: {coupled_cluster_pairs} ({coupled_cluster_pairs/total_cluster_pairs*100:.1f}%)")
+    else:
+        print(f"  有耦合的簇对: 0")
+    
+    # 参数级别统计
+    print(f"\n【参数级别统计】")
+    print(f"  总参数耦合数: {summary['total_couplings']}")
+    print(f"  涉及参数数量: {summary['unique_parameters']}")
+    print(f"  涉及簇对数量: {summary['unique_cluster_pairs']}")
+    
+    print(f"\n【按耦合类型】")
+    for coupling_type, count in summary['by_type'].items():
+        print(f"  - {coupling_type}: {count}")
+    
+    print(f"\n【按置信度】")
+    print(f"  - High: {summary['high_confidence_count']}")
+    print(f"  - Medium: {summary['medium_confidence_count']}")
+    print(f"  - Low: {summary['low_confidence_count']}")
+    
+    # Top 5 最多耦合的簇对
+    if summary['by_cluster_pair']:
+        print(f"\n【耦合最多的簇对 Top 5】")
+        top_pairs = sorted(
+            summary['by_cluster_pair'].items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )[:5]
+        for i, (pair, count) in enumerate(top_pairs, 1):
+            print(f"  {i}. {pair[0]} ↔ {pair[1]}: {count} 个耦合")
+    
     print("\n" + "="*70)
     print("✅ 分析完成！")
     print("="*70)
+    
+    # 输出文件清单
+    print("\n📁 生成的文件:")
+    print("  1. candidates.json              - 参数簇在文件中的匹配结果")
+    print("  2. cluster_pair_tasks.json      - 需要分析的簇对任务列表")
+    print("  3. cluster_pair_couplings.json  - LLM分析的簇对耦合结果")
+    print("  4. cluster_coupling_matrix.json - 簇对耦合矩阵 (仅包含使用的簇)")
+    print("  5. extracted_param_couplings.json - 参数级别的耦合列表")
+    print("  6. param_couplings_summary.json - 统计摘要")
+    print("  7. coupling_graph.gexf          - 参数耦合关系图\n")
+
 
 if __name__ == '__main__': 
     main()
